@@ -1,0 +1,685 @@
+from flask import Flask, request, jsonify, Response
+from flask_cors import CORS
+import cv2
+import numpy as np
+import time
+import json
+import threading
+from queue import Queue
+import base64
+
+app = Flask(__name__)
+CORS(app)
+# Add these imports at the top
+import io
+from PIL import Image
+
+# Add these new routes to your existing server.py
+
+@app.route('/api/current-frame')
+def get_current_frame():
+    """Get current annotated frame as base64 image"""
+    global analyzer
+    if analyzer and analyzer.current_annotated_frame is not None:
+        try:
+            # Convert frame to JPEG
+            ret, buffer = cv2.imencode('.jpg', analyzer.current_annotated_frame)
+            if ret:
+                # Convert to base64
+                img_str = base64.b64encode(buffer).decode('utf-8')
+                return jsonify({
+                    'image': f'data:image/jpeg;base64,{img_str}',
+                    'frame': analyzer.current_frame,
+                    'timestamp': time.time()
+                })
+        except Exception as e:
+            print(f"Error encoding frame: {e}")
+    
+    # Return empty frame
+    blank_frame = np.zeros((600, 800, 3), dtype=np.uint8)
+    cv2.putText(blank_frame, "Waiting for analysis...", (50, 300), 
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    ret, buffer = cv2.imencode('.jpg', blank_frame)
+    img_str = base64.b64encode(buffer).decode('utf-8')
+    return jsonify({
+        'image': f'data:image/jpeg;base64,{img_str}',
+        'frame': 0,
+        'timestamp': time.time()
+    })
+
+@app.route('/api/frame-stream')
+def frame_stream():
+    """SSE endpoint for frame updates"""
+    def generate():
+        while True:
+            if analyzer and analyzer.current_annotated_frame is not None:
+                try:
+                    ret, buffer = cv2.imencode('.jpg', analyzer.current_annotated_frame)
+                    if ret:
+                        img_str = base64.b64encode(buffer).decode('utf-8')
+                        yield f"data: {json.dumps({
+                            'image': f'data:image/jpeg;base64,{img_str}',
+                            'frame': analyzer.current_frame,
+                            'timestamp': time.time()
+                        })}\n\n"
+                    else:
+                        yield "data: {}\n\n"
+                except Exception as e:
+                    yield "data: {}\n\n"
+            else:
+                yield "data: {}\n\n"
+            time.sleep(0.1)  # 10 FPS
+    
+    return Response(generate(), mimetype='text/event-stream')
+class EnhancedRealPrintDetector:
+    def __init__(self):
+        self.setup_enhanced_detection()
+        self.defect_history = []
+        
+    def setup_enhanced_detection(self):
+        """Enhanced setup for real print videos"""
+        print("🔄 Setting up enhanced real print detector...")
+        
+        self.min_defect_area = 50
+        self.max_defect_area = 5000
+        self.min_persistence = 2
+        
+        # Store defect details for better reporting
+        self.defect_details = []
+        
+    def detect_enhanced_defects(self, frame, frame_count):
+        """Enhanced defect detection with detailed classification"""
+        if frame is None:
+            return []
+        
+        # Multiple processing methods for better detection
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Method 1: Adaptive thresholding
+        adaptive_binary = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 11, 2
+        )
+        
+        # Method 2: Canny edges
+        edges = cv2.Canny(gray, 30, 100)
+        
+        # Method 3: Simple threshold
+        _, simple_binary = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY)
+        
+        # Combine methods
+        combined = cv2.bitwise_or(adaptive_binary, edges)
+        combined = cv2.bitwise_or(combined, simple_binary)
+        
+        # Noise reduction
+        kernel = np.ones((3, 3), np.uint8)
+        cleaned = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel)
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
+        
+        # Find contours
+        contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        defects = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            
+            if not (self.min_defect_area <= area <= self.max_defect_area):
+                continue
+                
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter == 0:
+                continue
+                
+            # Detailed shape analysis
+            circularity = 4 * np.pi * area / (perimeter * perimeter)
+            x, y, w, h = cv2.boundingRect(contour)
+            aspect_ratio = w / h if h > 0 else 0
+            
+            # Calculate additional features
+            hull = cv2.convexHull(contour)
+            hull_area = cv2.contourArea(hull)
+            solidity = area / hull_area if hull_area > 0 else 0
+            
+            # Enhanced classification
+            defect_info = self.enhanced_classify_defect(
+                area, circularity, aspect_ratio, solidity, w, h, perimeter
+            )
+            
+            if defect_info:
+                defects.append({
+                    'type': defect_info['type'],
+                    'subtype': defect_info['subtype'],
+                    'area': area,
+                    'position': (x, y),
+                    'size': (w, h),
+                    'contour': contour,
+                    'circularity': circularity,
+                    'aspect_ratio': aspect_ratio,
+                    'solidity': solidity,
+                    'perimeter': perimeter,
+                    'frame': frame_count,
+                    'confidence': defect_info['confidence']
+                })
+                
+                # Store detailed defect information
+                self.defect_details.append({
+                    'frame': frame_count,
+                    'type': defect_info['type'],
+                    'subtype': defect_info['subtype'],
+                    'area': area,
+                    'position': (x, y),
+                    'confidence': defect_info['confidence']
+                })
+        
+        # Filter persistent defects
+        filtered_defects = self.filter_persistent_defects(defects, frame_count)
+        return filtered_defects
+    
+    def enhanced_classify_defect(self, area, circularity, aspect_ratio, solidity, w, h, perimeter):
+        """Enhanced defect classification with subtypes"""
+        
+        # STRINGING defects
+        if (circularity < 0.2 and aspect_ratio > 3.0 and 30 <= area <= 300):
+            if area < 100:
+                return {'type': 'STRINGING', 'subtype': 'Fine Stringing', 'confidence': 'HIGH'}
+            else:
+                return {'type': 'STRINGING', 'subtype': 'Thick Stringing', 'confidence': 'MEDIUM'}
+        
+        # BLOB defects
+        elif (circularity > 0.6 and 50 <= area <= 800):
+            if area < 200:
+                return {'type': 'BLOB', 'subtype': 'Small Blob', 'confidence': 'HIGH'}
+            else:
+                return {'type': 'BLOB', 'subtype': 'Large Blob', 'confidence': 'MEDIUM'}
+        
+        # LAYER ISSUES
+        elif (0.3 <= circularity <= 0.7 and 200 <= area <= 1500):
+            if solidity < 0.6:
+                return {'type': 'LAYER_ISSUE', 'subtype': 'Layer Separation', 'confidence': 'MEDIUM'}
+            else:
+                return {'type': 'LAYER_ISSUE', 'subtype': 'Layer Shift', 'confidence': 'MEDIUM'}
+        
+        # UNDER-EXTRUSION
+        elif (circularity < 0.4 and area > 400 and aspect_ratio > 1.5):
+            return {'type': 'UNDER_EXTRUSION', 'subtype': 'Gap/Under-extrusion', 'confidence': 'MEDIUM'}
+        
+        # OVER-EXTRUSION
+        elif (circularity > 0.5 and area > 500 and solidity > 0.7):
+            return {'type': 'OVER_EXTRUSION', 'subtype': 'Over-extrusion', 'confidence': 'MEDIUM'}
+        
+        # WARPING (large irregular shapes)
+        elif (area > 1000 and circularity < 0.3):
+            return {'type': 'WARPING', 'subtype': 'Warping/Curling', 'confidence': 'LOW'}
+        
+        return None
+    
+    def filter_persistent_defects(self, defects, frame_count):
+        """Filter defects that appear consistently"""
+        if not defects:
+            return []
+            
+        # Update history
+        self.defect_history.extend(defects)
+        
+        # Keep only recent history
+        if len(self.defect_history) > 50:
+            self.defect_history = self.defect_history[-50:]
+        
+        # Count occurrences
+        location_counts = {}
+        for defect in self.defect_history:
+            loc_key = f"{defect['position'][0]//15}_{defect['position'][1]//15}"
+            location_counts[loc_key] = location_counts.get(loc_key, 0) + 1
+        
+        # Filter based on persistence
+        persistent_defects = []
+        for defect in defects:
+            loc_key = f"{defect['position'][0]//15}_{defect['position'][1]//15}"
+            if location_counts.get(loc_key, 0) >= self.min_persistence:
+                persistent_defects.append(defect)
+        
+        return persistent_defects
+
+class EnhancedRealPrintVisualizer:
+    def __init__(self):
+        self.colors = {
+            'STRINGING': (0, 165, 255),    # Orange
+            'BLOB': (0, 0, 255),           # Red
+            'LAYER_ISSUE': (255, 0, 0),    # Blue
+            'UNDER_EXTRUSION': (0, 255, 0), # Green
+            'OVER_EXTRUSION': (255, 255, 0), # Yellow
+            'WARPING': (255, 0, 255)       # Purple
+        }
+        
+        self.defect_counter = {
+            'STRINGING': 0,
+            'BLOB': 0, 
+            'LAYER_ISSUE': 0,
+            'UNDER_EXTRUSION': 0,
+            'OVER_EXTRUSION': 0,
+            'WARPING': 0
+        }
+    
+    def create_detailed_display(self, frame, defects, frame_count, total_frames, fps, pause_mode=False):
+        """Create detailed display with defect information"""
+        display_frame = frame.copy()
+        
+        # Update defect counters
+        for defect in defects:
+            self.defect_counter[defect['type']] += 1
+        
+        # Draw defects with detailed labels
+        for i, defect in enumerate(defects):
+            color = self.colors.get(defect['type'], (255, 255, 255))
+            x, y = defect['position']
+            w, h = defect['size']
+            
+            # Draw bounding box
+            cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, 2)
+            
+            # Draw contour
+            cv2.drawContours(display_frame, [defect['contour']], -1, color, 1)
+            
+            # Detailed label
+            label = f"{defect['type']}: {defect['subtype']}"
+            info1 = f"Area: {defect['area']:.0f}px"
+            info2 = f"Conf: {defect['confidence']}"
+            
+            # Background for text
+            text_bg_y = y - 60 if y > 70 else y + h + 5
+            cv2.rectangle(display_frame, (x-2, text_bg_y-55), (x+200, text_bg_y+5), (0,0,0), -1)
+            cv2.rectangle(display_frame, (x-2, text_bg_y-55), (x+200, text_bg_y+5), color, 1)
+            
+            # Text
+            cv2.putText(display_frame, label, (x, text_bg_y-40), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            cv2.putText(display_frame, info1, (x, text_bg_y-20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+            cv2.putText(display_frame, info2, (x, text_bg_y-5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+        
+        # Add comprehensive info panel
+        self.draw_detailed_info_panel(display_frame, defects, frame_count, total_frames, fps, pause_mode)
+        
+        return display_frame
+    
+    def draw_detailed_info_panel(self, frame, defects, frame_count, total_frames, fps, pause_mode):
+        """Draw detailed information panel"""
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (10, 10), (500, 250), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+        
+        progress = (frame_count / total_frames) * 100 if total_frames > 0 else 0
+        
+        # Main info
+        info_lines = [
+            "🎥 REAL PRINT DEFECT ANALYSIS - SLOW MODE",
+            f"Frame: {frame_count}/{total_frames} ({progress:.1f}%)",
+            f"FPS: {fps:.1f}",
+            f"Current Defects: {len(defects)}",
+            f"PAUSED: {'YES' if pause_mode else 'NO'}",
+            ""
+        ]
+        
+        # Defect counters
+        defect_lines = [
+            "DEFECT COUNTERS:",
+            f"Stringing: {self.defect_counter['STRINGING']}",
+            f"Blobs: {self.defect_counter['BLOB']}",
+            f"Layer Issues: {self.defect_counter['LAYER_ISSUE']}",
+            f"Under-extrusion: {self.defect_counter['UNDER_EXTRUSION']}",
+            f"Over-extrusion: {self.defect_counter['OVER_EXTRUSION']}",
+            f"Warping: {self.defect_counter['WARPING']}",
+            ""
+        ]
+        
+        # Controls
+        control_lines = [
+            "CONTROLS:",
+            "Q = Quit",
+            "P = Pause/Resume", 
+            "S = Single Step (when paused)",
+            "D = Show Defect Details",
+            "R = Reset Counters"
+        ]
+        
+        all_lines = info_lines + defect_lines + control_lines
+        
+        for i, line in enumerate(all_lines):
+            y_pos = 35 + i * 18
+            color = (255, 255, 255)
+            
+            # Color code defect counters
+            if "Stringing" in line: color = (0, 165, 255)
+            elif "Blobs" in line: color = (0, 0, 255)
+            elif "Layer Issues" in line: color = (255, 0, 0)
+            elif "Under-extrusion" in line: color = (0, 255, 0)
+            elif "Over-extrusion" in line: color = (255, 255, 0)
+            elif "Warping" in line: color = (255, 0, 255)
+            elif "REAL PRINT" in line: color = (0, 255, 255)
+            elif "CONTROLS" in line: color = (255, 255, 0)
+            
+            cv2.putText(frame, line, (20, y_pos), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+
+class SlowMotionPrintAnalyzer:
+    def __init__(self, video_path):
+        self.video_path = video_path
+        self.detector = EnhancedRealPrintDetector()
+        self.visualizer = EnhancedRealPrintVisualizer()
+        self.is_running = False
+        self.is_paused = False
+        self.single_step = False
+        self.current_frame = 0
+        self.total_frames = 0
+        self.defect_log = []
+        self.current_defects = []
+        self.console_output = []
+        self.current_annotated_frame = None
+        self.cap = None
+        
+    def log_message(self, message):
+        """Log message to console output"""
+        self.console_output.append(message)
+        if len(self.console_output) > 50:
+            self.console_output = self.console_output[-50:]
+        print(message)
+        
+    def start_slow_analysis(self):
+        """Start analysis in slow motion with detailed information"""
+        self.is_running = True
+        self.is_paused = False
+        self.single_step = False
+        
+        self.log_message("🚀 Starting SLOW MOTION Real Print Analysis")
+        self.log_message("💡 Video will play slower with detailed defect information")
+        
+        self.cap = cv2.VideoCapture(self.video_path)
+        if not self.cap.isOpened():
+            self.log_message(f"❌ Error opening: {self.video_path}")
+            return
+        
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        original_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        
+        self.log_message(f"📊 Video: {self.total_frames} frames, {original_fps:.1f} FPS")
+        self.log_message(f"🎯 Using SLOW MOTION mode for detailed analysis")
+        
+        self.log_message("\n✅ Controls:")
+        self.log_message("   P = Pause/Resume") 
+        self.log_message("   S = Single Step (when paused)")
+        self.log_message("   D = Show Defect Details")
+        self.log_message("   R = Reset Counters")
+        
+        frame_count = 0
+        self.defect_log = []
+        
+        while self.is_running and frame_count < self.total_frames:
+            if not self.is_paused or self.single_step:
+                ret, frame = self.cap.read()
+                if not ret:
+                    self.log_message("🎬 End of video reached")
+                    break
+                
+                self.single_step = False
+                
+                # Process frame using your existing detector
+                start_time = time.time()
+                defects = self.detector.detect_enhanced_defects(frame, frame_count)
+                self.defect_log.extend(defects)
+                self.current_defects = defects
+                processing_time = time.time() - start_time
+                
+                # Calculate FPS
+                current_fps = 1.0 / processing_time if processing_time > 0 else 0
+                
+                # Create annotated frame using your visualizer
+                annotated_frame = self.visualizer.create_detailed_display(
+                    frame, defects, frame_count, self.total_frames, current_fps, self.is_paused
+                )
+                
+                # Resize for better display
+                self.current_annotated_frame = cv2.resize(annotated_frame, (800, 600))
+                
+                # Update frame count
+                self.current_frame = frame_count
+                
+                # Detailed console output for defects
+                if defects:
+                    self.log_message(f"\n📋 Frame {frame_count} - {len(defects)} Defects:")
+                    for i, defect in enumerate(defects):
+                        self.log_message(f"   {i+1}. {defect['type']} - {defect['subtype']}")
+                        self.log_message(f"      Area: {defect['area']:.0f}px, Confidence: {defect['confidence']}")
+                        self.log_message(f"      Position: {defect['position']}")
+                
+                frame_count += 1
+                
+                # Slow motion delay
+                time.sleep(0.5)
+            else:
+                time.sleep(0.1)
+        
+        if self.cap:
+            self.cap.release()
+        self.is_running = False
+        self.generate_detailed_report()
+    
+    def show_defect_details(self):
+        """Show detailed defect information"""
+        if not self.defect_log:
+            self.log_message("📝 No defects detected yet")
+            return
+        
+        self.log_message(f"\n📊 DEFECT DETAILS (Total: {len(self.defect_log)})")
+        self.log_message("="*50)
+        
+        # Group by type
+        type_groups = {}
+        for defect in self.defect_log:
+            defect_type = defect['type']
+            if defect_type not in type_groups:
+                type_groups[defect_type] = []
+            type_groups[defect_type].append(defect)
+        
+        for defect_type, defects in type_groups.items():
+            self.log_message(f"\n{defect_type}: {len(defects)} defects")
+            subtypes = {}
+            for defect in defects:
+                subtype = defect['subtype']
+                subtypes[subtype] = subtypes.get(subtype, 0) + 1
+            
+            for subtype, count in subtypes.items():
+                avg_area = sum(d['area'] for d in defects if d['subtype'] == subtype) / count
+                self.log_message(f"  └─ {subtype}: {count} (avg area: {avg_area:.0f}px)")
+    
+    def generate_detailed_report(self):
+        """Generate comprehensive report"""
+        self.log_message("\n" + "="*60)
+        self.log_message("📊 SLOW MOTION ANALYSIS - DETAILED REPORT")
+        self.log_message("="*60)
+        
+        self.log_message(f"Total frames analyzed: {self.current_frame}")
+        self.log_message(f"Total defects detected: {len(self.defect_log)}")
+        
+        if self.defect_log:
+            defect_rate = (len(self.defect_log) / self.current_frame) * 100
+            self.log_message(f"Defect rate: {defect_rate:.2f}%")
+            
+            # Detailed breakdown
+            self.log_message(f"\n🔍 DETAILED DEFECT BREAKDOWN:")
+            type_stats = {}
+            for defect in self.defect_log:
+                defect_type = defect['type']
+                if defect_type not in type_stats:
+                    type_stats[defect_type] = {'count': 0, 'subtypes': {}, 'total_area': 0}
+                
+                type_stats[defect_type]['count'] += 1
+                type_stats[defect_type]['total_area'] += defect['area']
+                
+                subtype = defect['subtype']
+                type_stats[defect_type]['subtypes'][subtype] = type_stats[defect_type]['subtypes'].get(subtype, 0) + 1
+            
+            for defect_type, stats in type_stats.items():
+                percentage = (stats['count'] / len(self.defect_log)) * 100
+                avg_area = stats['total_area'] / stats['count']
+                self.log_message(f"\n{defect_type}: {stats['count']} defects ({percentage:.1f}%)")
+                self.log_message(f"  Average area: {avg_area:.0f}px")
+                self.log_message(f"  Subtypes:")
+                for subtype, count in stats['subtypes'].items():
+                    subtype_percentage = (count / stats['count']) * 100
+                    self.log_message(f"    • {subtype}: {count} ({subtype_percentage:.1f}%)")
+            
+            # Quality assessment
+            self.log_message(f"\n🎯 PRINT QUALITY ASSESSMENT:")
+            if len(self.defect_log) == 0:
+                self.log_message("✅ PERFECT: No defects detected")
+            elif defect_rate < 1.0:
+                self.log_message("✅ EXCELLENT: Minimal defects")
+            elif defect_rate < 3.0:
+                self.log_message("⚠️  GOOD: Some minor issues")
+            elif defect_rate < 8.0:
+                self.log_message("🔶 MODERATE: Several issues - check calibration")
+            else:
+                self.log_message("❌ POOR: Significant issues - maintenance needed")
+        
+        self.log_message("="*60)
+
+# Global analyzer instance
+analyzer = None
+
+def generate_frames():
+    """Generate video frames with annotations for streaming"""
+    global analyzer
+    while True:
+        if analyzer and analyzer.current_annotated_frame is not None:
+            # Encode frame as JPEG
+            ret, buffer = cv2.imencode('.jpg', analyzer.current_annotated_frame)
+            frame = buffer.tobytes()
+            
+            # Yield frame in MJPEG format
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        else:
+            # Send a blank frame or waiting frame
+            blank_frame = np.zeros((600, 800, 3), dtype=np.uint8)
+            cv2.putText(blank_frame, "Waiting for analysis...", (50, 300), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            ret, buffer = cv2.imencode('.jpg', blank_frame)
+            frame = buffer.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        time.sleep(0.1)  # Control frame rate
+
+# ==============================
+# Flask Routes
+# ==============================
+
+@app.route('/api/start-analysis', methods=['POST'])
+def start_analysis():
+    global analyzer
+    
+    if analyzer and analyzer.is_running:
+        return jsonify({'error': 'Analysis already running'}), 400
+    
+    data = request.json
+    video_path = data.get('video_path', 'path/to/analysis/file')
+    
+    # Create new analyzer with your exact classes
+    analyzer = SlowMotionPrintAnalyzer(video_path)
+    
+    # Start analysis in background thread
+    analysis_thread = threading.Thread(target=analyzer.start_slow_analysis)
+    analysis_thread.daemon = True
+    analysis_thread.start()
+    
+    return jsonify({'message': 'Analysis started'})
+
+@app.route('/api/pause-analysis', methods=['POST'])
+def pause_analysis():
+    global analyzer
+    if analyzer:
+        analyzer.is_paused = not analyzer.is_paused
+        status = "paused" if analyzer.is_paused else "resumed"
+        analyzer.log_message(f"⏸️ Analysis {status}")
+        return jsonify({'paused': analyzer.is_paused})
+    return jsonify({'error': 'No analysis running'}), 400
+
+@app.route('/api/single-step', methods=['POST'])
+def single_step():
+    global analyzer
+    if analyzer and analyzer.is_paused:
+        analyzer.single_step = True
+        analyzer.log_message("▶️ Single step")
+        return jsonify({'message': 'Single step activated'})
+    return jsonify({'error': 'Analysis not paused'}), 400
+
+@app.route('/api/stop-analysis', methods=['POST'])
+def stop_analysis():
+    global analyzer
+    if analyzer:
+        analyzer.is_running = False
+        analyzer.log_message("🛑 Analysis stopped")
+        return jsonify({'message': 'Analysis stopped'})
+    return jsonify({'error': 'No analysis running'}), 400
+
+@app.route('/api/reset-counters', methods=['POST'])
+def reset_counters():
+    global analyzer
+    if analyzer:
+        analyzer.visualizer.defect_counter = {k: 0 for k in analyzer.visualizer.defect_counter}
+        analyzer.log_message("🔄 Counters reset")
+        return jsonify({'message': 'Counters reset'})
+    return jsonify({'error': 'No analysis running'}), 400
+
+@app.route('/api/defect-details', methods=['GET'])
+def get_defect_details():
+    global analyzer
+    if analyzer:
+        analyzer.show_defect_details()
+        return jsonify({'message': 'Defect details shown in console'})
+    return jsonify({'error': 'No analysis running'}), 400
+
+@app.route('/api/analysis-state', methods=['GET'])
+def get_analysis_state():
+    global analyzer
+    if analyzer:
+        return jsonify({
+            'is_running': analyzer.is_running,
+            'is_paused': analyzer.is_paused,
+            'current_frame': analyzer.current_frame,
+            'total_frames': analyzer.total_frames,
+            'defects': analyzer.current_defects,
+            'defect_counter': analyzer.visualizer.defect_counter,
+            'console_output': analyzer.console_output,
+            'fps': 0
+        })
+    else:
+        return jsonify({
+            'is_running': False,
+            'is_paused': False,
+            'current_frame': 0,
+            'total_frames': 0,
+            'defects': [],
+            'defect_counter': {
+                'STRINGING': 0,
+                'BLOB': 0,
+                'LAYER_ISSUE': 0,
+                'UNDER_EXTRUSION': 0,
+                'OVER_EXTRUSION': 0,
+                'WARPING': 0
+            },
+            'console_output': [],
+            'fps': 0
+        })
+
+@app.route('/video_feed')
+def video_feed():
+    """Video streaming route that shows annotated frames"""
+    return Response(generate_frames(),
+                   mimetype='multipart/x-mixed-replace; boundary=frame')
+
+if __name__ == '__main__':
+    print("Starting Flask server on http://localhost:5000")
+    print("Your Python classes are fully integrated!")
+    print("Video streaming available at: http://localhost:5000/video_feed")
+    app.run(host='0.0.0.0', port=5000, debug=True)
