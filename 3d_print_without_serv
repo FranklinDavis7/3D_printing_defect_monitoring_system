@@ -1,0 +1,496 @@
+import cv2
+import numpy as np
+import time
+
+# ==============================
+# Enhanced Real Print Defect Detector
+# ==============================
+class EnhancedRealPrintDetector:
+    def __init__(self):
+        self.setup_enhanced_detection()
+        self.defect_history = []
+        
+    def setup_enhanced_detection(self):
+        """Enhanced setup for real print videos"""
+        print("🔄 Setting up enhanced real print detector...")
+        
+        self.min_defect_area = 50
+        self.max_defect_area = 5000
+        self.min_persistence = 2
+        
+        # Store defect details for better reporting
+        self.defect_details = []
+        
+    def detect_enhanced_defects(self, frame, frame_count):
+        """Enhanced defect detection with detailed classification"""
+        if frame is None:
+            return []
+        
+        # Multiple processing methods for better detection
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Method 1: Adaptive thresholding
+        adaptive_binary = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 11, 2
+        )
+        
+        # Method 2: Canny edges
+        edges = cv2.Canny(gray, 30, 100)
+        
+        # Method 3: Simple threshold
+        _, simple_binary = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY)
+        
+        # Combine methods
+        combined = cv2.bitwise_or(adaptive_binary, edges)
+        combined = cv2.bitwise_or(combined, simple_binary)
+        
+        # Noise reduction
+        kernel = np.ones((3, 3), np.uint8)
+        cleaned = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel)
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
+        
+        # Find contours
+        contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        defects = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            
+            if not (self.min_defect_area <= area <= self.max_defect_area):
+                continue
+                
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter == 0:
+                continue
+                
+            # Detailed shape analysis
+            circularity = 4 * np.pi * area / (perimeter * perimeter)
+            x, y, w, h = cv2.boundingRect(contour)
+            aspect_ratio = w / h if h > 0 else 0
+            
+            # Calculate additional features
+            hull = cv2.convexHull(contour)
+            hull_area = cv2.contourArea(hull)
+            solidity = area / hull_area if hull_area > 0 else 0
+            
+            # Enhanced classification
+            defect_info = self.enhanced_classify_defect(
+                area, circularity, aspect_ratio, solidity, w, h, perimeter
+            )
+            
+            if defect_info:
+                defects.append({
+                    'type': defect_info['type'],
+                    'subtype': defect_info['subtype'],
+                    'area': area,
+                    'position': (x, y),
+                    'size': (w, h),
+                    'contour': contour,
+                    'circularity': circularity,
+                    'aspect_ratio': aspect_ratio,
+                    'solidity': solidity,
+                    'perimeter': perimeter,
+                    'frame': frame_count,
+                    'confidence': defect_info['confidence']
+                })
+                
+                # Store detailed defect information
+                self.defect_details.append({
+                    'frame': frame_count,
+                    'type': defect_info['type'],
+                    'subtype': defect_info['subtype'],
+                    'area': area,
+                    'position': (x, y),
+                    'confidence': defect_info['confidence']
+                })
+        
+        # Filter persistent defects
+        filtered_defects = self.filter_persistent_defects(defects, frame_count)
+        return filtered_defects
+    
+    def enhanced_classify_defect(self, area, circularity, aspect_ratio, solidity, w, h, perimeter):
+        """Enhanced defect classification with subtypes"""
+        
+        # STRINGING defects
+        if (circularity < 0.2 and aspect_ratio > 3.0 and 30 <= area <= 300):
+            if area < 100:
+                return {'type': 'STRINGING', 'subtype': 'Fine Stringing', 'confidence': 'HIGH'}
+            else:
+                return {'type': 'STRINGING', 'subtype': 'Thick Stringing', 'confidence': 'MEDIUM'}
+        
+        # BLOB defects
+        elif (circularity > 0.6 and 50 <= area <= 800):
+            if area < 200:
+                return {'type': 'BLOB', 'subtype': 'Small Blob', 'confidence': 'HIGH'}
+            else:
+                return {'type': 'BLOB', 'subtype': 'Large Blob', 'confidence': 'MEDIUM'}
+        
+        # LAYER ISSUES
+        elif (0.3 <= circularity <= 0.7 and 200 <= area <= 1500):
+            if solidity < 0.6:
+                return {'type': 'LAYER_ISSUE', 'subtype': 'Layer Separation', 'confidence': 'MEDIUM'}
+            else:
+                return {'type': 'LAYER_ISSUE', 'subtype': 'Layer Shift', 'confidence': 'MEDIUM'}
+        
+        # UNDER-EXTRUSION
+        elif (circularity < 0.4 and area > 400 and aspect_ratio > 1.5):
+            return {'type': 'UNDER_EXTRUSION', 'subtype': 'Gap/Under-extrusion', 'confidence': 'MEDIUM'}
+        
+        # OVER-EXTRUSION
+        elif (circularity > 0.5 and area > 500 and solidity > 0.7):
+            return {'type': 'OVER_EXTRUSION', 'subtype': 'Over-extrusion', 'confidence': 'MEDIUM'}
+        
+        # WARPING (large irregular shapes)
+        elif (area > 1000 and circularity < 0.3):
+            return {'type': 'WARPING', 'subtype': 'Warping/Curling', 'confidence': 'LOW'}
+        
+        return None
+    
+    def filter_persistent_defects(self, defects, frame_count):
+        """Filter defects that appear consistently"""
+        if not defects:
+            return []
+            
+        # Update history
+        self.defect_history.extend(defects)
+        
+        # Keep only recent history
+        if len(self.defect_history) > 50:
+            self.defect_history = self.defect_history[-50:]
+        
+        # Count occurrences
+        location_counts = {}
+        for defect in self.defect_history:
+            loc_key = f"{defect['position'][0]//15}_{defect['position'][1]//15}"
+            location_counts[loc_key] = location_counts.get(loc_key, 0) + 1
+        
+        # Filter based on persistence
+        persistent_defects = []
+        for defect in defects:
+            loc_key = f"{defect['position'][0]//15}_{defect['position'][1]//15}"
+            if location_counts.get(loc_key, 0) >= self.min_persistence:
+                persistent_defects.append(defect)
+        
+        return persistent_defects
+
+# ==============================
+# Enhanced Visualizer with Detailed Info
+# ==============================
+class EnhancedRealPrintVisualizer:
+    def __init__(self):
+        self.colors = {
+            'STRINGING': (0, 165, 255),    # Orange
+            'BLOB': (0, 0, 255),           # Red
+            'LAYER_ISSUE': (255, 0, 0),    # Blue
+            'UNDER_EXTRUSION': (0, 255, 0), # Green
+            'OVER_EXTRUSION': (255, 255, 0), # Yellow
+            'WARPING': (255, 0, 255)       # Purple
+        }
+        
+        self.defect_counter = {
+            'STRINGING': 0,
+            'BLOB': 0, 
+            'LAYER_ISSUE': 0,
+            'UNDER_EXTRUSION': 0,
+            'OVER_EXTRUSION': 0,
+            'WARPING': 0
+        }
+    
+    def create_detailed_display(self, frame, defects, frame_count, total_frames, fps, pause_mode=False):
+        """Create detailed display with defect information"""
+        display_frame = frame.copy()
+        
+        # Update defect counters
+        for defect in defects:
+            self.defect_counter[defect['type']] += 1
+        
+        # Draw defects with detailed labels
+        for i, defect in enumerate(defects):
+            color = self.colors.get(defect['type'], (255, 255, 255))
+            x, y = defect['position']
+            w, h = defect['size']
+            
+            # Draw bounding box
+            cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, 2)
+            
+            # Draw contour
+            cv2.drawContours(display_frame, [defect['contour']], -1, color, 1)
+            
+            # Detailed label
+            label = f"{defect['type']}: {defect['subtype']}"
+            info1 = f"Area: {defect['area']:.0f}px"
+            info2 = f"Conf: {defect['confidence']}"
+            
+            # Background for text
+            text_bg_y = y - 60 if y > 70 else y + h + 5
+            cv2.rectangle(display_frame, (x-2, text_bg_y-55), (x+200, text_bg_y+5), (0,0,0), -1)
+            cv2.rectangle(display_frame, (x-2, text_bg_y-55), (x+200, text_bg_y+5), color, 1)
+            
+            # Text
+            cv2.putText(display_frame, label, (x, text_bg_y-40), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            cv2.putText(display_frame, info1, (x, text_bg_y-20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+            cv2.putText(display_frame, info2, (x, text_bg_y-5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+        
+        # Add comprehensive info panel
+        self.draw_detailed_info_panel(display_frame, defects, frame_count, total_frames, fps, pause_mode)
+        
+        return display_frame
+    
+    def draw_detailed_info_panel(self, frame, defects, frame_count, total_frames, fps, pause_mode):
+        """Draw detailed information panel"""
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (10, 10), (500, 250), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+        
+        progress = (frame_count / total_frames) * 100 if total_frames > 0 else 0
+        
+        # Main info
+        info_lines = [
+            "🎥 REAL PRINT DEFECT ANALYSIS - SLOW MODE",
+            f"Frame: {frame_count}/{total_frames} ({progress:.1f}%)",
+            f"FPS: {fps:.1f}",
+            f"Current Defects: {len(defects)}",
+            f"PAUSED: {'YES' if pause_mode else 'NO'}",
+            ""
+        ]
+        
+        # Defect counters
+        defect_lines = [
+            "DEFECT COUNTERS:",
+            f"Stringing: {self.defect_counter['STRINGING']}",
+            f"Blobs: {self.defect_counter['BLOB']}",
+            f"Layer Issues: {self.defect_counter['LAYER_ISSUE']}",
+            f"Under-extrusion: {self.defect_counter['UNDER_EXTRUSION']}",
+            f"Over-extrusion: {self.defect_counter['OVER_EXTRUSION']}",
+            f"Warping: {self.defect_counter['WARPING']}",
+            ""
+        ]
+        
+        # Controls
+        control_lines = [
+            "CONTROLS:",
+            "Q = Quit",
+            "P = Pause/Resume", 
+            "S = Single Step (when paused)",
+            "D = Show Defect Details",
+            "R = Reset Counters"
+        ]
+        
+        all_lines = info_lines + defect_lines + control_lines
+        
+        for i, line in enumerate(all_lines):
+            y_pos = 35 + i * 18
+            color = (255, 255, 255)
+            
+            # Color code defect counters
+            if "Stringing" in line: color = (0, 165, 255)
+            elif "Blobs" in line: color = (0, 0, 255)
+            elif "Layer Issues" in line: color = (255, 0, 0)
+            elif "Under-extrusion" in line: color = (0, 255, 0)
+            elif "Over-extrusion" in line: color = (255, 255, 0)
+            elif "Warping" in line: color = (255, 0, 255)
+            elif "REAL PRINT" in line: color = (0, 255, 255)
+            elif "CONTROLS" in line: color = (255, 255, 0)
+            
+            cv2.putText(frame, line, (20, y_pos), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+
+# ==============================
+# Slow Motion Analyzer
+# ==============================
+class SlowMotionPrintAnalyzer:
+    def __init__(self, video_path):
+        self.video_path = video_path
+        self.detector = EnhancedRealPrintDetector()
+        self.visualizer = EnhancedRealPrintVisualizer()
+        
+    def start_slow_analysis(self):
+        """Start analysis in slow motion with detailed information"""
+        print("🚀 Starting SLOW MOTION Real Print Analysis")
+        print("💡 Video will play slower with detailed defect information")
+        
+        cap = cv2.VideoCapture(self.video_path)
+        if not cap.isOpened():
+            print(f"❌ Error opening: {self.video_path}")
+            return
+        
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        original_fps = cap.get(cv2.CAP_PROP_FPS)
+        
+        print(f"📊 Video: {total_frames} frames, {original_fps:.1f} FPS")
+        print(f"🎯 Using SLOW MOTION mode for detailed analysis")
+        
+        frame_count = 0
+        defect_log = []
+        paused = False
+        single_step = False
+        
+        print("\n✅ Controls:")
+        print("   Q = Quit")
+        print("   P = Pause/Resume") 
+        print("   S = Single Step (when paused)")
+        print("   D = Show Defect Details")
+        print("   R = Reset Counters")
+        
+        while True:
+            if not paused or single_step:
+                ret, frame = cap.read()
+                if not ret:
+                    print("🎬 End of video reached")
+                    break
+                
+                single_step = False
+                
+                # Process frame
+                start_time = time.time()
+                defects = self.detector.detect_enhanced_defects(frame, frame_count)
+                defect_log.extend(defects)
+                processing_time = time.time() - start_time
+                
+                # Calculate FPS
+                current_fps = 1.0 / processing_time if processing_time > 0 else 0
+                
+                # Create detailed display
+                display_frame = self.visualizer.create_detailed_display(
+                    frame, defects, frame_count, total_frames, current_fps, paused
+                )
+                
+                # Show results
+                display_frame = cv2.resize(display_frame, (1000, 800))
+                cv2.imshow("SLOW MOTION Print Defect Analysis", display_frame)
+                
+                # Detailed console output for defects
+                if defects:
+                    print(f"\n📋 Frame {frame_count} - {len(defects)} Defects:")
+                    for i, defect in enumerate(defects):
+                        print(f"   {i+1}. {defect['type']} - {defect['subtype']}")
+                        print(f"      Area: {defect['area']:.0f}px, Confidence: {defect['confidence']}")
+                        print(f"      Position: {defect['position']}")
+                
+                frame_count += 1
+            
+            # Handle controls with delays for slow motion
+            key = cv2.waitKey(100 if paused else 50) & 0xFF  # Slower playback
+            
+            if key == ord('q'):
+                break
+            elif key == ord('p'):
+                paused = not paused
+                status = "PAUSED" if paused else "RESUMED"
+                print(f"⏸️  {status}")
+            elif key == ord('s') and paused:
+                single_step = True
+                print("▶️  Single step")
+            elif key == ord('d'):
+                self.show_defect_details(defect_log)
+            elif key == ord('r'):
+                self.visualizer.defect_counter = {k: 0 for k in self.visualizer.defect_counter}
+                print("🔄 Counters reset")
+        
+        cap.release()
+        cv2.destroyAllWindows()
+        self.generate_detailed_report(defect_log, frame_count)
+    
+    def show_defect_details(self, defect_log):
+        """Show detailed defect information"""
+        if not defect_log:
+            print("📝 No defects detected yet")
+            return
+        
+        print(f"\n📊 DEFECT DETAILS (Total: {len(defect_log)})")
+        print("="*50)
+        
+        # Group by type
+        type_groups = {}
+        for defect in defect_log:
+            defect_type = defect['type']
+            if defect_type not in type_groups:
+                type_groups[defect_type] = []
+            type_groups[defect_type].append(defect)
+        
+        for defect_type, defects in type_groups.items():
+            print(f"\n{defect_type}: {len(defects)} defects")
+            subtypes = {}
+            for defect in defects:
+                subtype = defect['subtype']
+                subtypes[subtype] = subtypes.get(subtype, 0) + 1
+            
+            for subtype, count in subtypes.items():
+                avg_area = sum(d['area'] for d in defects if d['subtype'] == subtype) / count
+                print(f"  └─ {subtype}: {count} (avg area: {avg_area:.0f}px)")
+    
+    def generate_detailed_report(self, defect_log, total_frames):
+        """Generate comprehensive report"""
+        print("\n" + "="*60)
+        print("📊 SLOW MOTION ANALYSIS - DETAILED REPORT")
+        print("="*60)
+        
+        print(f"Total frames analyzed: {total_frames}")
+        print(f"Total defects detected: {len(defect_log)}")
+        
+        if defect_log:
+            defect_rate = (len(defect_log) / total_frames) * 100
+            print(f"Defect rate: {defect_rate:.2f}%")
+            
+            # Detailed breakdown
+            print(f"\n🔍 DETAILED DEFECT BREAKDOWN:")
+            type_stats = {}
+            for defect in defect_log:
+                defect_type = defect['type']
+                if defect_type not in type_stats:
+                    type_stats[defect_type] = {'count': 0, 'subtypes': {}, 'total_area': 0}
+                
+                type_stats[defect_type]['count'] += 1
+                type_stats[defect_type]['total_area'] += defect['area']
+                
+                subtype = defect['subtype']
+                type_stats[defect_type]['subtypes'][subtype] = type_stats[defect_type]['subtypes'].get(subtype, 0) + 1
+            
+            for defect_type, stats in type_stats.items():
+                percentage = (stats['count'] / len(defect_log)) * 100
+                avg_area = stats['total_area'] / stats['count']
+                print(f"\n{defect_type}: {stats['count']} defects ({percentage:.1f}%)")
+                print(f"  Average area: {avg_area:.0f}px")
+                print(f"  Subtypes:")
+                for subtype, count in stats['subtypes'].items():
+                    subtype_percentage = (count / stats['count']) * 100
+                    print(f"    • {subtype}: {count} ({subtype_percentage:.1f}%)")
+            
+            # Quality assessment
+            print(f"\n🎯 PRINT QUALITY ASSESSMENT:")
+            if len(defect_log) == 0:
+                print("✅ PERFECT: No defects detected")
+            elif defect_rate < 1.0:
+                print("✅ EXCELLENT: Minimal defects")
+            elif defect_rate < 3.0:
+                print("⚠️  GOOD: Some minor issues")
+            elif defect_rate < 8.0:
+                print("🔶 MODERATE: Several issues - check calibration")
+            else:
+                print("❌ POOR: Significant issues - maintenance needed")
+        
+        print("="*60)
+
+# ==============================
+# Main Execution
+# ==============================
+def main():
+    print("🖨️  SLOW MOTION REAL PRINT ANALYZER")
+    print("Plays video slower with detailed defect information")
+    
+    video_path = "/Users/fda10h04gmail.com/Desktop/3d_printing_2.mov"
+    
+    analyzer = SlowMotionPrintAnalyzer(video_path)
+    try:
+        analyzer.start_slow_analysis()
+    except KeyboardInterrupt:
+        print("\n🛑 Analysis stopped by user")
+    except Exception as e:
+        print(f"❌ Error: {e}")
+
+if __name__ == "__main__":
+    main()
